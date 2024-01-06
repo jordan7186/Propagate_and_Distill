@@ -1,0 +1,808 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import dgl.function as fn
+from torch import Tensor
+from torch_geometric.typing import Adj, OptTensor
+from typing import Optional
+from torch_geometric.nn.models import LabelPropagation
+from dgl.nn import GraphConv, SAGEConv, APPNPConv, GATConv
+import dgl  # only for LAGE
+
+
+class PropagateAPPR(torch.nn.Module):
+    def __init__(self, num_iteration, gamma: float = 0.9):
+        super().__init__()
+
+        self.prop_lp = LabelPropagation(num_iteration, gamma)
+
+    def forward(
+        self,
+        logits: Tensor,
+        edge_index: Adj,
+        training_idx: Optional[Tensor] = None,
+        edge_weight: OptTensor = None,
+    ) -> Tensor:
+        # def replace_func(x):
+        #     x[training_idx] = logit_original[training_idx]
+
+        if training_idx is None:
+            temp = self.prop_lp(
+                logits, edge_index, edge_weight=edge_weight, post_step=lambda x: x
+            )
+
+        else:
+            logit_original = logits[training_idx]
+            temp = self.prop_lp(
+                logits,
+                edge_index,
+                edge_weight=edge_weight,
+                post_step=lambda x: x.index_copy_(0, training_idx, logit_original),
+            )
+
+        return temp / temp.sum(dim=1).view(-1, 1)
+
+
+class InvertPPR(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.prop_lp = LabelPropagation(1, 1)
+
+    def forward(
+        self,
+        logits: Tensor,
+        edge_index: Adj,
+        self_coeff: float = 2.0,
+        gamma: float = 0.9,
+        edge_weight: OptTensor = None,
+    ) -> Tensor:
+        """
+        Invert PPR (= 2I - gamma tilde{A})
+        """
+        prop_logit = self.prop_lp(
+            logits, edge_index, edge_weight=edge_weight, post_step=lambda x: x
+        )
+
+        return self_coeff * logits - gamma * prop_logit
+
+
+class MLP(nn.Module):
+    def __init__(
+        self,
+        num_layers,
+        input_dim,
+        hidden_dim,
+        output_dim,
+        dropout_ratio,
+        norm_type="none",
+    ):
+        super(MLP, self).__init__()
+        self.num_layers = num_layers
+        self.norm_type = norm_type
+        self.dropout = nn.Dropout(dropout_ratio)
+        self.layers = nn.ModuleList()
+        self.norms = nn.ModuleList()
+
+        if num_layers == 1:
+            self.layers.append(nn.Linear(input_dim, output_dim))
+        else:
+            self.layers.append(nn.Linear(input_dim, hidden_dim))
+
+            if self.norm_type == "batch":
+                self.norms.append(nn.BatchNorm1d(hidden_dim))
+            elif self.norm_type == "layer":
+                self.norms.append(nn.LayerNorm(hidden_dim))
+
+            for i in range(num_layers - 2):
+                self.layers.append(nn.Linear(hidden_dim, hidden_dim))
+                if self.norm_type == "batch":
+                    self.norms.append(nn.BatchNorm1d(hidden_dim))
+                elif self.norm_type == "layer":
+                    self.norms.append(nn.LayerNorm(hidden_dim))
+
+            self.layers.append(nn.Linear(hidden_dim, output_dim))
+
+    def forward(self, feats):
+        h = feats
+        for l, layer in enumerate(self.layers):
+            h = layer(h)
+            if l != self.num_layers - 1:
+                if self.norm_type != "none":
+                    h = self.norms[l](h)
+                h = F.relu(h)
+                h = self.dropout(h)
+
+        return None, h  # To match the rest of the codebase
+
+
+class MLP_dw(nn.Module):
+    def __init__(
+        self,
+        num_layers,
+        input_dim,
+        position_dim,
+        hidden_dim,
+        output_dim,
+        dropout_ratio,
+        norm_type="none",
+        graph=None,
+        byte_idx_train=None,
+        labels_one_hot=None,
+    ):
+        super(MLP_dw, self).__init__()
+        self.num_layers = num_layers
+        self.norm_type = norm_type
+        self.dropout = nn.Dropout(dropout_ratio)
+        self.layers = nn.ModuleList()
+        self.norms = nn.ModuleList()
+
+        if num_layers == 1:
+            self.layers.append(nn.Linear(input_dim + position_dim, output_dim))
+        else:
+            self.layers.append(nn.Linear(input_dim + position_dim, hidden_dim))
+
+            if self.norm_type == "batch":
+                self.norms.append(nn.BatchNorm1d(hidden_dim))
+            elif self.norm_type == "layer":
+                self.norms.append(nn.LayerNorm(hidden_dim))
+
+            for i in range(num_layers - 2):
+                self.layers.append(nn.Linear(hidden_dim, hidden_dim))
+                if self.norm_type == "batch":
+                    self.norms.append(nn.BatchNorm1d(hidden_dim))
+                elif self.norm_type == "layer":
+                    self.norms.append(nn.LayerNorm(hidden_dim))
+
+            self.layers.append(nn.Linear(hidden_dim, output_dim))
+            self.teacher_feature_encoder = nn.Linear(hidden_dim, hidden_dim)
+            self.mlp_feature_encoder = nn.Linear(hidden_dim, hidden_dim)
+            self.mlp_feature_encoder_2 = nn.Linear(hidden_dim, hidden_dim)
+
+    def forward(self, feats):
+        h = feats
+        h_list = []
+        for l, layer in enumerate(self.layers):
+            h = layer(h)
+            if l != self.num_layers - 1:
+                h_list.append(h)
+                if self.norm_type != "none":
+                    h = self.norms[l](h)
+                h = F.relu(h)
+                h = self.dropout(h)
+
+        return h_list, h
+
+    def encode_teacher4kd(self, teacher_feat):
+        return self.dropout(F.relu(self.teacher_feature_encoder(teacher_feat)))
+
+    def encode_mlp4kd(self, mlp_feat):
+        return self.dropout(F.relu(self.mlp_feature_encoder(mlp_feat)))
+
+
+"""
+Adapted from the SAGE implementation from the official DGL example
+https://github.com/dmlc/dgl/blob/master/examples/pytorch/ogb/ogbn-products/graphsage/main.py
+"""
+
+
+class SAGE(nn.Module):
+    def __init__(
+        self,
+        num_layers,
+        input_dim,
+        hidden_dim,
+        output_dim,
+        dropout_ratio,
+        activation,
+        norm_type="none",
+    ):
+        super().__init__()
+        self.num_layers = num_layers
+        self.hidden_dim = hidden_dim
+        self.output_dim = output_dim
+        self.norm_type = norm_type
+        self.activation = activation
+        self.dropout = nn.Dropout(dropout_ratio)
+        self.layers = nn.ModuleList()
+        self.norms = nn.ModuleList()
+
+        if num_layers == 1:
+            self.layers.append(SAGEConv(input_dim, output_dim, "gcn"))
+        else:
+            self.layers.append(SAGEConv(input_dim, hidden_dim, "gcn"))
+            if self.norm_type == "batch":
+                self.norms.append(nn.BatchNorm1d(hidden_dim))
+            elif self.norm_type == "layer":
+                self.norms.append(nn.LayerNorm(hidden_dim))
+
+            for i in range(num_layers - 2):
+                self.layers.append(SAGEConv(hidden_dim, hidden_dim, "gcn"))
+                if self.norm_type == "batch":
+                    self.norms.append(nn.BatchNorm1d(hidden_dim))
+                elif self.norm_type == "layer":
+                    self.norms.append(nn.LayerNorm(hidden_dim))
+
+            self.layers.append(SAGEConv(hidden_dim, output_dim, "gcn"))
+
+    def forward(self, blocks, feats):
+        h = feats
+        h_list = []
+        for l, (layer, block) in enumerate(zip(self.layers, blocks)):
+            h_dst = h[: block.num_dst_nodes()]
+            h = layer(block, (h, h_dst))
+            if l != self.num_layers - 1:
+                h_list.append(h)
+                if self.norm_type != "none":
+                    h = self.norms[l](h)
+                h = self.activation(h)
+                h = self.dropout(h)
+        return h_list, h
+
+    def inference(self, dataloader, feats):
+        """
+        Inference with the GraphSAGE model on full neighbors (i.e. without neighbor sampling).
+        dataloader : The entire graph loaded in blocks with full neighbors for each node.
+        feats : The input feats of entire node set.
+        """
+        device = feats.device
+        emb_list = []
+        for l, layer in enumerate(self.layers):
+            # add-on
+            hidden_emb = torch.zeros(
+                feats.shape[0],
+                self.hidden_dim if l != self.num_layers - 1 else self.output_dim,
+            ).to(device)
+
+            y = torch.zeros(
+                feats.shape[0],
+                self.hidden_dim if l != self.num_layers - 1 else self.output_dim,
+            ).to(device)
+            for input_nodes, output_nodes, blocks in dataloader:
+                block = blocks[0].int().to(device)
+
+                h = feats[input_nodes]
+                h_dst = h[: block.num_dst_nodes()]
+                h = layer(block, (h, h_dst))
+                if l != self.num_layers - 1:
+                    hidden_emb[output_nodes] = h
+                    if self.norm_type != "none":
+                        h = self.norms[l](h)
+                    h = self.activation(h)
+                    h = self.dropout(h)
+
+                y[output_nodes] = h
+
+            feats = y
+            if l != self.num_layers - 1:
+                emb_list.append(hidden_emb)
+        # return y
+        return y, emb_list
+
+
+# Now let's try to add label propagation layer
+# while for simplicitly, fixing the number of SAGE layers to 2
+class LAGE(nn.Module):
+    def __init__(
+        self,
+        num_layers,
+        input_dim,
+        hidden_dim,
+        output_dim,
+        dropout_ratio,
+        activation,
+        norm_type="none",
+    ):
+        super().__init__()
+        assert num_layers == 2
+
+        self.num_layers = num_layers
+        self.hidden_dim = hidden_dim
+        self.output_dim = output_dim
+        self.norm_type = norm_type
+        self.activation = activation
+        self.dropout = nn.Dropout(dropout_ratio)
+        self.layers = nn.ModuleList()
+        self.norms = nn.ModuleList()
+        self.additional_layers = nn.ModuleList()
+
+        self.layers.append(SAGEConv(input_dim, hidden_dim, "gcn"))
+        if self.norm_type == "batch":
+            self.norms.append(nn.BatchNorm1d(hidden_dim))
+        elif self.norm_type == "layer":
+            self.norms.append(nn.LayerNorm(hidden_dim))
+
+        self.layers.append(SAGEConv(hidden_dim, hidden_dim, "gcn"))
+
+        # To make things easier, don't append LabelPropagation layer here, just
+        # keep it as a separate layer (same with linear layer)
+        self.additional_layers.append(
+            dgl.nn.pytorch.utils.LabelPropagation(
+                k=20, alpha=0.9, clamp=False, normalize=False
+            )
+        )
+        self.additional_layers.append(nn.Linear(hidden_dim, output_dim))
+
+        # We need a new feed forward for this. The model is: SAGE (2 layers) -> LP -> Linear
+
+    # No need for h_list
+    def forward(self, g, feats):
+        h = feats
+        h_list = None
+        for l, layer in enumerate(self.layers):
+            h = layer(g, h)
+            if l != self.num_layers - 1:
+                if self.norm_type != "none":
+                    h = self.norms[l](h)
+                h = self.dropout(h)
+
+        # LP and Linear
+        h = self.additional_layers[0](g, h)
+        h = self.additional_layers[1](h)
+        return h_list, h
+
+
+class CAGE(nn.Module):
+    def __init__(
+        self,
+        num_layers,
+        input_dim,
+        hidden_dim,
+        output_dim,
+        dropout_ratio,
+        activation,
+        norm_type="none",
+    ):
+        super().__init__()
+        assert num_layers == 2
+
+        self.num_layers = num_layers
+        self.hidden_dim = hidden_dim
+        self.output_dim = output_dim
+        self.norm_type = norm_type
+        self.activation = activation
+        self.dropout = nn.Dropout(dropout_ratio)
+        self.layers = nn.ModuleList()
+        self.norms = nn.ModuleList()
+
+        self.layers.append(SAGEConv(input_dim, hidden_dim, "gcn"))
+        if self.norm_type == "batch":
+            self.norms.append(nn.BatchNorm1d(hidden_dim))
+        elif self.norm_type == "layer":
+            self.norms.append(nn.LayerNorm(hidden_dim))
+
+        self.layers.append(SAGEConv(hidden_dim, output_dim, "gcn"))
+
+        # To make things easier, don't append LabelPropagation layer here, just
+        # keep it as a separate layer (same with linear layer)
+        self.lp = dgl.nn.pytorch.utils.LabelPropagation(
+            k=20, alpha=0.9, clamp=False, normalize=False
+        )
+
+        # We need a new feed forward for this. The model is: SAGE (2 layers) -> LP -> Linear
+
+    # No need for h_list
+    def forward(self, g, feats):
+        h = feats
+        h_list = None
+        for l, layer in enumerate(self.layers):
+            h = layer(g, h)
+            if l != self.num_layers - 1:
+                if self.norm_type != "none":
+                    h = self.norms[l](h)
+                h = self.dropout(h)
+
+        # LP and Linear
+        h = self.lp(g, h)
+        return h_list, h
+
+
+class GCN(nn.Module):
+    def __init__(
+        self,
+        num_layers,
+        input_dim,
+        hidden_dim,
+        output_dim,
+        dropout_ratio,
+        activation,
+        norm_type="none",
+    ):
+        super().__init__()
+        self.num_layers = num_layers
+        self.norm_type = norm_type
+        self.dropout = nn.Dropout(dropout_ratio)
+        self.layers = nn.ModuleList()
+        self.norms = nn.ModuleList()
+
+        if num_layers == 1:
+            self.layers.append(GraphConv(input_dim, output_dim, activation=activation))
+        else:
+            self.layers.append(GraphConv(input_dim, hidden_dim, activation=activation))
+            if self.norm_type == "batch":
+                self.norms.append(nn.BatchNorm1d(hidden_dim))
+            elif self.norm_type == "layer":
+                self.norms.append(nn.LayerNorm(hidden_dim))
+
+            for i in range(num_layers - 2):
+                self.layers.append(
+                    GraphConv(hidden_dim, hidden_dim, activation=activation)
+                )
+                if self.norm_type == "batch":
+                    self.norms.append(nn.BatchNorm1d(hidden_dim))
+                elif self.norm_type == "layer":
+                    self.norms.append(nn.LayerNorm(hidden_dim))
+
+            self.layers.append(GraphConv(hidden_dim, output_dim))
+
+    def forward(self, g, feats):
+        h = feats
+        h_list = []
+        for l, layer in enumerate(self.layers):
+            h = layer(g, h)
+            if l != self.num_layers - 1:
+                h_list.append(h)
+                if self.norm_type != "none":
+                    h = self.norms[l](h)
+                h = self.dropout(h)
+        return h_list, h
+
+
+class GAT(nn.Module):
+    def __init__(
+        self,
+        num_layers,
+        input_dim,
+        hidden_dim,
+        output_dim,
+        dropout_ratio,
+        activation,
+        num_heads=8,
+        attn_drop=0.3,
+        negative_slope=0.2,
+        residual=False,
+    ):
+        super(GAT, self).__init__()
+        # For GAT, the number of layers is required to be > 1
+        assert num_layers > 1
+
+        hidden_dim //= num_heads
+        self.num_layers = num_layers
+        self.layers = nn.ModuleList()
+        self.activation = activation
+
+        heads = ([num_heads] * num_layers) + [1]
+        # input (no residual)
+        self.layers.append(
+            GATConv(
+                input_dim,
+                hidden_dim,
+                heads[0],
+                dropout_ratio,
+                attn_drop,
+                negative_slope,
+                False,
+                self.activation,
+            )
+        )
+
+        for l in range(1, num_layers - 1):
+            # due to multi-head, the in_dim = hidden_dim * num_heads
+            self.layers.append(
+                GATConv(
+                    hidden_dim * heads[l - 1],
+                    hidden_dim,
+                    heads[l],
+                    dropout_ratio,
+                    attn_drop,
+                    negative_slope,
+                    residual,
+                    self.activation,
+                )
+            )
+
+        self.layers.append(
+            GATConv(
+                hidden_dim * heads[-2],
+                output_dim,
+                heads[-1],
+                dropout_ratio,
+                attn_drop,
+                negative_slope,
+                residual,
+                None,
+            )
+        )
+
+    def forward(self, g, feats):
+        h = feats
+        h_list = []
+        for l, layer in enumerate(self.layers):
+            # [num_head, node_num, nclass] -> [num_head, node_num*nclass]
+            h = layer(g, h)
+            if l != self.num_layers - 1:
+                h = h.flatten(1)
+                h_list.append(h)
+            else:
+                h = h.mean(1)
+        return h_list, h
+
+
+class APPNP(nn.Module):
+    def __init__(
+        self,
+        num_layers,
+        input_dim,
+        hidden_dim,
+        output_dim,
+        dropout_ratio,
+        activation,
+        norm_type="none",
+        edge_drop=0.5,
+        alpha=0.1,
+        k=10,
+    ):
+        super(APPNP, self).__init__()
+        self.num_layers = num_layers
+        self.norm_type = norm_type
+        self.activation = activation
+        self.dropout = nn.Dropout(dropout_ratio)
+        self.layers = nn.ModuleList()
+        self.norms = nn.ModuleList()
+
+        if num_layers == 1:
+            self.layers.append(nn.Linear(input_dim, output_dim))
+        else:
+            self.layers.append(nn.Linear(input_dim, hidden_dim))
+            if self.norm_type == "batch":
+                self.norms.append(nn.BatchNorm1d(hidden_dim))
+            elif self.norm_type == "layer":
+                self.norms.append(nn.LayerNorm(hidden_dim))
+
+            for i in range(num_layers - 2):
+                self.layers.append(nn.Linear(hidden_dim, hidden_dim))
+                if self.norm_type == "batch":
+                    self.norms.append(nn.BatchNorm1d(hidden_dim))
+                elif self.norm_type == "layer":
+                    self.norms.append(nn.LayerNorm(hidden_dim))
+
+            self.layers.append(nn.Linear(hidden_dim, output_dim))
+
+        self.propagate = APPNPConv(k, alpha, edge_drop)
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        for layer in self.layers:
+            layer.reset_parameters()
+
+    def forward(self, g, feats):
+        h = feats
+        h_list = []
+        for l, layer in enumerate(self.layers):
+            h = layer(h)
+
+            if l != self.num_layers - 1:
+                h_list.append(h)
+                if self.norm_type != "none":
+                    h = self.norms[l](h)
+                h = self.activation(h)
+                h = self.dropout(h)
+
+        h = self.propagate(g, h)
+        return h_list, h
+
+
+class Model(nn.Module):
+    """
+    Wrapper of different models
+    """
+
+    def __init__(
+        self,
+        conf,
+    ):
+        super(Model, self).__init__()
+        self.model_name = conf["model_name"]
+        if "MLP" in conf["model_name"]:
+            # origin
+            self.encoder = MLP(
+                num_layers=conf["num_layers"],
+                input_dim=conf["feat_dim"],
+                hidden_dim=conf["hidden_dim"],
+                output_dim=conf["label_dim"],
+                dropout_ratio=conf["dropout_ratio"],
+                # dropout_ratio=0,
+                norm_type=conf["norm_type"],
+            ).to(conf["device"])
+
+        elif "SAGE" in conf["model_name"]:
+            self.encoder = SAGE(
+                num_layers=conf["num_layers"],
+                input_dim=conf["feat_dim"],
+                hidden_dim=conf["hidden_dim"],
+                output_dim=conf["label_dim"],
+                dropout_ratio=conf["dropout_ratio"],
+                activation=F.relu,
+                norm_type=conf["norm_type"],
+            ).to(conf["device"])
+        elif "LAGE" in conf["model_name"]:
+            self.encoder = LAGE(
+                num_layers=conf["num_layers"],
+                input_dim=conf["feat_dim"],
+                hidden_dim=conf["hidden_dim"],
+                output_dim=conf["label_dim"],
+                dropout_ratio=conf["dropout_ratio"],
+                activation=F.relu,
+                norm_type=conf["norm_type"],
+            ).to(conf["device"])
+        elif "CAGE" in conf["model_name"]:
+            self.encoder = CAGE(
+                num_layers=conf["num_layers"],
+                input_dim=conf["feat_dim"],
+                hidden_dim=conf["hidden_dim"],
+                output_dim=conf["label_dim"],
+                dropout_ratio=conf["dropout_ratio"],
+                activation=F.relu,
+                norm_type=conf["norm_type"],
+            ).to(conf["device"])
+        elif "GCN" in conf["model_name"]:
+            self.encoder = GCN(
+                num_layers=conf["num_layers"],
+                input_dim=conf["feat_dim"],
+                hidden_dim=conf["hidden_dim"],
+                output_dim=conf["label_dim"],
+                dropout_ratio=conf["dropout_ratio"],
+                activation=F.relu,
+                norm_type=conf["norm_type"],
+            ).to(conf["device"])
+        elif "GAT" in conf["model_name"]:
+            self.encoder = GAT(
+                num_layers=conf["num_layers"],
+                input_dim=conf["feat_dim"],
+                hidden_dim=conf["hidden_dim"],
+                output_dim=conf["label_dim"],
+                dropout_ratio=conf["dropout_ratio"],
+                activation=F.relu,
+                attn_drop=conf["attn_dropout_ratio"],
+            ).to(conf["device"])
+        elif "APPNP" in conf["model_name"]:
+            self.encoder = APPNP(
+                num_layers=conf["num_layers"],
+                input_dim=conf["feat_dim"],
+                hidden_dim=conf["hidden_dim"],
+                output_dim=conf["label_dim"],
+                dropout_ratio=conf["dropout_ratio"],
+                activation=F.relu,
+                norm_type=conf["norm_type"],
+            ).to(conf["device"])
+
+    def forward(self, data, feats):
+        """
+        data: a graph `g` or a `dataloader` of blocks
+        """
+        if "MLP" in self.model_name:
+            return self.encoder(feats)
+        elif (
+            "GCN" in self.model_name
+            or "GAT" in self.model_name
+            or "APPNP" in self.model_name
+        ):
+            return self.encoder(data, feats)
+        else:
+            return self.encoder(data, feats)[1]
+
+    def inference(self, data, feats):
+        if "SAGE" in self.model_name:
+            return self.encoder.inference(data, feats)
+        else:
+            return self.forward(data, feats)
+
+
+class Model_dw(nn.Module):
+    """
+    Wrapper of different models
+    """
+
+    def __init__(
+        self,
+        conf,
+        args,
+        position_feature_dim=0,
+        graph=None,
+        byte_idx_train=None,
+        labels_one_hot=None,
+    ):
+        super(Model_dw, self).__init__()
+        self.model_name = conf["model_name"]
+        if "MLP" in conf["model_name"]:
+            # origin
+            self.encoder = MLP_dw(
+                num_layers=conf["num_layers"],
+                input_dim=conf["feat_dim"],
+                position_dim=position_feature_dim,
+                hidden_dim=conf["hidden_dim"],
+                output_dim=conf["label_dim"],
+                dropout_ratio=conf["dropout_ratio"],
+                norm_type=conf["norm_type"],
+                graph=graph,
+                byte_idx_train=byte_idx_train,
+                labels_one_hot=labels_one_hot,
+            ).to(conf["device"])
+
+        elif "SAGE" in conf["model_name"]:
+            self.encoder = SAGE(
+                num_layers=conf["num_layers"],
+                input_dim=conf["feat_dim"],
+                hidden_dim=conf["hidden_dim"],
+                output_dim=conf["label_dim"],
+                dropout_ratio=conf["dropout_ratio"],
+                activation=F.relu,
+                norm_type=conf["norm_type"],
+            ).to(conf["device"])
+        elif "GCN" in conf["model_name"]:
+            self.encoder = GCN(
+                num_layers=conf["num_layers"],
+                input_dim=conf["feat_dim"],
+                hidden_dim=conf["hidden_dim"],
+                output_dim=conf["label_dim"],
+                dropout_ratio=conf["dropout_ratio"],
+                activation=F.relu,
+                norm_type=conf["norm_type"],
+            ).to(conf["device"])
+        elif "GAT" in conf["model_name"]:
+            self.encoder = GAT(
+                num_layers=conf["num_layers"],
+                input_dim=conf["feat_dim"],
+                hidden_dim=conf["hidden_dim"],
+                output_dim=conf["label_dim"],
+                dropout_ratio=conf["dropout_ratio"],
+                activation=F.relu,
+                attn_drop=conf["attn_dropout_ratio"],
+            ).to(conf["device"])
+        elif "APPNP" in conf["model_name"]:
+            self.encoder = APPNP(
+                num_layers=conf["num_layers"],
+                input_dim=conf["feat_dim"],
+                hidden_dim=conf["hidden_dim"],
+                output_dim=conf["label_dim"],
+                dropout_ratio=conf["dropout_ratio"],
+                activation=F.relu,
+                norm_type=conf["norm_type"],
+            ).to(conf["device"])
+
+    def forward(self, data, feats):
+        """
+        data: a graph `g` or a `dataloader` of blocks
+        """
+        if "MLP" in self.model_name:
+            return self.encoder(feats)
+        elif (
+            "GCN" in self.model_name
+            or "GAT" in self.model_name
+            or "APPNP" in self.model_name
+        ):
+            return self.encoder(data, feats)
+        else:
+            return self.encoder(data, feats)[1]
+
+    def forward_fitnet(self, data, feats):
+        """
+        Return a tuple (h_list, h)
+        h_list: intermediate hidden representation
+        h: final output
+        """
+        if "MLP" in self.model_name:
+            return self.encoder(feats)
+        else:
+            return self.encoder(data, feats)
+
+    def inference(self, data, feats):
+        if "SAGE" in self.model_name:
+            return self.encoder.inference(data, feats)
+        else:
+            return self.forward(data, feats)
+
+    def encode_teacher4kd(self, teacher_feat):
+        return self.encoder.encode_teacher4kd(teacher_feat)
+
+    def encode_mlp4kd(self, mlp_feat):
+        return self.encoder.encode_mlp4kd(mlp_feat)

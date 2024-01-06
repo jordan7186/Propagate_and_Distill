@@ -1,0 +1,146 @@
+global:
+  num_layers: 2
+  hidden_dim: 128
+
+# ============================================================
+cora:
+  MLP:
+    learning_rate: 0.01
+    weight_decay: 0.005
+    dropout_ratio: 0.6
+
+  SAGE:
+    fan_out: 5,5
+    learning_rate: 0.01
+    dropout_ratio: 0
+    weight_decay: 0.0005
+
+# ============================================================
+citeseer:
+  MLP:
+    learning_rate: 0.01
+    weight_decay: 0.001
+    dropout_ratio: 0.5
+
+  SAGE:
+    fan_out: 5,5
+    learning_rate: 0.01
+    dropout_ratio: 0
+    weight_decay: 0.0005
+
+# ============================================================
+pubmed:
+  MLP:
+    learning_rate: 0.005
+    weight_decay: 0.001
+    dropout_ratio: 0.4
+
+  SAGE:
+    fan_out: 5,5
+    learning_rate: 0.01
+    dropout_ratio: 0
+    weight_decay: 0.0005
+
+# ============================================================
+a-computer:
+  MLP:
+    learning_rate: 0.003
+    weight_decay: 0.005
+    dropout_ratio: 0.5
+
+  SAGE:
+    fan_out: 5,5
+    learning_rate: 0.01
+    dropout_ratio: 0
+    weight_decay: 0.0005
+
+# ============================================================
+a-photo:
+  MLP:
+    learning_rate: 0.001
+    weight_decay: 0.001
+    dropout_ratio: 0.5
+
+  SAGE:
+    fan_out: 5,5
+    learning_rate: 0.01
+    dropout_ratio: 0
+    weight_decay: 0.0005
+# ===========================================================
+ogbn-arxiv:
+
+  MLP3w4:
+    num_layers: 3
+    hidden_dim: 1024
+    weight_decay: 0
+    dropout_ratio: 0.5
+    learning_rate: 0.01
+    norm_type: none
+    batch_size: 4096
+
+  MLP3w8:
+    num_layers: 3
+    hidden_dim: 2048
+    weight_decay: 0
+    dropout_ratio: 0.5
+    learning_rate: 0.01
+    norm_type: none
+    batch_size: 4096
+
+  MLP:
+    learning_rate: 0.01
+    weight_decay: 0
+    dropout_ratio: 0.2
+    num_layers: 2
+    hidden_dim: 256
+    norm_type: none
+    batch_size: 512
+
+  SAGE:
+    num_layers: 2
+    hidden_dim: 256
+    dropout_ratio: 0.2
+    learning_rate: 0.01
+    weight_decay: 0
+    norm_type: batch
+    fan_out: 5,10
+    batch_size: 4096
+
+# ============================================================
+ogbn-products:
+  MLP:
+    learning_rate: 0.003
+    num_layers: 3
+    hidden_dim: 256
+    dropout_ratio: 0.5
+    weight_decay: 0
+    norm_type: none
+    batch_size: 2048
+
+  MLP3w8:
+    num_layers: 3
+    hidden_dim: 2048
+    dropout_ratio: 0.2
+    learning_rate: 0.01
+    weight_decay: 0
+    norm_type: none
+    batch_size: 4096
+
+  MLP3w4:
+    num_layers: 3
+    hidden_dim: 1024
+    dropout_ratio: 0.2
+    learning_rate: 0.01
+    weight_decay: 0
+    norm_type: none
+    batch_size: 4096
+
+  SAGE:
+    num_layers: 2
+    hidden_dim: 256
+    dropout_ratio: 0.5
+    learning_rate: 0.003
+    weight_decay: 0
+    norm_type: batch
+    fan_out: 5,10
+    batch_size: 4096
